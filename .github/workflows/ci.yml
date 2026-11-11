@@ -18,3 +18,14 @@ jobs:
         run: python3 -m unittest test_scan
       - name: Self-scan (gate on high findings)
         run: python3 deploy-security-gate/skills/deploy-security-gate/scripts/scan.py . --history --entropy --fail-on high
+
+  validate-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code  # security-gate: allow (trusted first-party CLI)
+      - name: Validate marketplace manifest
+        run: claude plugin validate --strict .
+      - name: Validate plugin manifest
+        run: claude plugin validate --strict ./deploy-security-gate
