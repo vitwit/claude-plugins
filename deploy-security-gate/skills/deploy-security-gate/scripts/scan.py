@@ -5,8 +5,11 @@ Static, read-only checks for the "Security Checklist: Deploying & Maintaining
 Products at Scale". Standard library only. It never prints a full secret value.
 
 Usage:
-    python3 scan.py <repo> [--build-dir DIR ...] [--history] [--format md|json]
-                           [--fail-on high|medium|low|never]
+    python3 scan.py <repo> [--build-dir DIR ...] [--history] [--entropy]
+                           [--format md|json|sarif] [--fail-on high|medium|low|never]
+
+Findings can be suppressed with a `.security-gate-ignore` file at the repo root or an
+inline `# security-gate: allow` comment on the flagged line.
 
 Exit codes: 0 = no findings at or above --fail-on, 1 = findings at or above it,
 2 = usage error.
@@ -64,8 +67,22 @@ SECRET_PATTERNS = [
     ("huggingface-token", "Hugging Face token", r"\bhf_[A-Za-z0-9]{34,}\b", "high"),
     ("db-url-with-password", "Connection string with inline password",
      r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?)://[^:\s/'\"]+:[^@\s'\"]{6,}@[^\s'\"]+", "high"),
+    ("slack-app-token", "Slack app-level token", r"\bxapp-[0-9]-[A-Za-z0-9]+-[0-9]+-[A-Za-z0-9]+", "high"),
+    ("digitalocean-token", "DigitalOcean personal access token", r"\bdop_v1_[a-f0-9]{64}\b", "high"),
+    ("new-relic-key", "New Relic API key", r"\bNRAK-[A-Z0-9]{27}\b", "high"),
+    ("shopify-token", "Shopify access token", r"\bshp(?:at|ss|pa|ca)_[a-fA-F0-9]{32}\b", "high"),
+    ("square-token", "Square OAuth secret", r"\bsq0csp-[A-Za-z0-9_\-]{43}\b", "high"),
+    ("databricks-token", "Databricks personal access token", r"\bdapi[0-9a-f]{32}\b", "high"),
+    ("doppler-token", "Doppler token", r"\bdp\.(?:pt|st|sa|ct|scim)\.[A-Za-z0-9]{40,44}\b", "high"),
+    ("planetscale-token", "PlanetScale token", r"\bpscale_(?:pw|tkn)_[A-Za-z0-9_\-]{32,}\b", "high"),
+    ("linear-key", "Linear API key", r"\blin_api_[A-Za-z0-9]{40}\b", "high"),
+    ("azure-storage-key", "Azure Storage account key", r"AccountKey=[A-Za-z0-9+/]{86}==", "high"),
+    ("telegram-bot-token", "Telegram bot token", r"\b[0-9]{8,10}:AA[A-Za-z0-9_\-]{32,35}\b", "medium"),
+    ("discord-webhook", "Discord webhook URL", r"https://discord(?:app)?\.com/api/webhooks/[0-9]{17,}/[A-Za-z0-9_\-]{60,}", "medium"),
+    ("mailgun-key", "Mailgun API key", r"\bkey-[0-9a-f]{32}\b", "medium"),
+    ("jwt", "JSON Web Token", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "low"),
 ]
-_SECRET_NAME = r"[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN)[A-Z0-9_]*"
+_SECRET_NAME = r"[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN|SERVICE_ROLE|CREDENTIALS?)[A-Z0-9_]*"
 GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')\s*[:=]\s*["\']([^"\'\s]{16,})["\']')
 # Unquoted assignments: env/YAML/TOML/INI style (`API_KEY=abc…`, `password: abc…`).
 # Only applied to config-ish files to avoid matching expressions in real code.
@@ -78,7 +95,19 @@ NEVER_DOWNGRADE = {
     "aws-access-key", "anthropic-key", "openai-key", "stripe-live-secret", "stripe-webhook-secret",
     "github-token", "gitlab-token", "slack-token", "gcp-service-account", "private-key",
     "npm-token", "pypi-token", "sendgrid-key", "huggingface-token", "db-url-with-password",
+    "slack-app-token", "digitalocean-token", "new-relic-key", "shopify-token", "square-token",
+    "databricks-token", "doppler-token", "planetscale-token", "linear-key", "azure-storage-key",
 }
+
+# Entropy detection: catch custom/novel secrets no vendor regex knows. Deliberately
+# conservative (low severity, tight heuristics) to stay usable in CI.
+ENTROPY_STRING_RX = re.compile(r"""["'`]([A-Za-z0-9+/_\-]{24,}={0,2})["'`]""")
+ENTROPY_FILE_SKIP = re.compile(
+    r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|go\.sum|Cargo\.lock|composer\.lock|"
+    r"Gemfile\.lock|poetry\.lock)$|\.min\.(js|css)$|\.map$|\.snap$", re.I)
+ENTROPY_LINE_SKIP = re.compile(r"sha(1|256|384|512)|integrity|checksum|digest|data:|base64,|-----BEGIN", re.I)
+ENTROPY_EXT_SKIP = {".md", ".rst", ".txt", ".csv", ".svg"}
+ENTROPY_MIN_BITS = 4.0
 # Split into two groups. STRUCTURAL hints are matched as substrings (they can't be
 # part of a real secret). WORD hints are English words that routinely appear *inside*
 # real tokens ("latest" contains "test", "yourco" contains "your"), so they are only
@@ -238,6 +267,24 @@ def line_of(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
 
 
+def shannon_bits(s: str) -> float:
+    from math import log2
+    n = len(s)
+    if n == 0:
+        return 0.0
+    counts: dict[str, int] = {}
+    for c in s:
+        counts[c] = counts.get(c, 0) + 1
+    return -sum((c / n) * log2(c / n) for c in counts.values())
+
+
+def looks_like_secret_blob(s: str) -> bool:
+    # Require a base64-ish mix (lower + upper + digit) so plain hex digests, English
+    # words and all-one-case identifiers don't trip the entropy check.
+    return (any(c.islower() for c in s) and any(c.isupper() for c in s)
+            and any(c.isdigit() for c in s))
+
+
 # ---------------------------------------------------------------- checks
 def scan_secrets(report: Report, repo: Path, path: Path, text: str, where: str = "source"):
     is_example = re.search(r"(example|sample|template|\.dist)$|\.example\.|fixtures?/|__tests__|/tests?/", rel(repo, path), re.I)
@@ -276,6 +323,30 @@ def scan_secrets(report: Report, repo: Path, path: Path, text: str, where: str =
                 report.add("medium", "secret:hardcoded-assignment", "1 Secrets",
                            f"{r}:{line_of(text, m.start())}",
                            f"Hard-coded value assigned to `{name}`: {mask(value)}")
+
+
+def check_entropy(report: Report, repo: Path, path: Path, text: str):
+    """Flag high-entropy string literals that no named pattern caught. Low severity:
+    these are candidates to verify, not confirmed secrets."""
+    r = rel(repo, path)
+    if ENTROPY_FILE_SKIP.search(r) or path.suffix.lower() in ENTROPY_EXT_SKIP:
+        return
+    for m in ENTROPY_STRING_RX.finditer(text):
+        value = m.group(1)
+        if value in report.reported_values or is_placeholder(value):
+            continue
+        if not looks_like_secret_blob(value) or shannon_bits(value) < ENTROPY_MIN_BITS:
+            continue
+        ls = text.rfind("\n", 0, m.start()) + 1
+        le = text.find("\n", m.end())
+        line = text[ls: le if le != -1 else len(text)]
+        if ENTROPY_LINE_SKIP.search(line):
+            continue
+        report.reported_values.add(value)
+        report.add("low", "secret:high-entropy-string", "1 Secrets",
+                   f"{r}:{line_of(text, m.start())}",
+                   f"High-entropy string ({shannon_bits(value):.1f} bits/char), no known format: "
+                   f"{mask(value)}. Verify it is not a secret.")
 
 
 def gitignore_covers_env(gi: Path) -> bool:
@@ -386,6 +457,14 @@ def check_workflows(report: Report, repo: Path):
         for m in re.finditer(r"(echo|printf)[^\n]*\$\{\{\s*secrets\.", text):
             report.add("high", "ci-secret-echo", "8 CI/CD", f"{r}:{line_of(text, m.start())}",
                        "A secret is echoed in a run step; it may reach logs or files.")
+        for m in re.finditer(r"(?m)^.*\$\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}.*$", text):
+            line = m.group(0)
+            if re.search(r"echo|printf", line):
+                continue  # already covered by ci-secret-echo
+            if re.search(r">>|>\s|\btee\b|\$GITHUB_ENV|\$GITHUB_OUTPUT|::set-output|::save-state", line):
+                report.add("high", "ci-secret-to-file", "8 CI/CD", f"{r}:{line_of(text, m.start())}",
+                           "A secret is written to a file, `$GITHUB_ENV` or `$GITHUB_OUTPUT`; "
+                           "it can persist on disk or leak into later steps and logs.")
         for m in re.finditer(r"(AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|GOOGLE_CREDENTIALS|AZURE_CREDENTIALS|GCP_SA_KEY)\s*:\s*\$\{\{\s*secrets\.", text):
             report.add("medium", "ci-static-cloud-keys", "8 CI/CD / 14 NHI",
                        f"{r}:{line_of(text, m.start())}",
@@ -478,27 +557,50 @@ def detect_integrations(report: Report, repo: Path, files: list[Path]):
                    "One payment processor detected. Confirm the outage plan (queued retries, customer messaging, secondary processor).")
 
 
-def scan_history(report: Report, repo: Path):
-    log = run_git(repo, "log", "--all", "-p", "--no-color", "--unified=0", "--format=COMMIT %h")
-    if log is None:
+def scan_history(report: Report, repo: Path, budget_seconds: int = 300):
+    """Stream `git log -p` line by line so a large monorepo's history does not have
+    to fit in memory. Stops after budget_seconds and notes the truncation."""
+    import time
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo), "log", "--all", "-p", "--no-color", "--unified=0", "--format=COMMIT %h"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
         report.notes.append("Git history scan skipped (not a git repo or git failed).")
+        return
+    if proc.stdout is None:
         return
     commit, fname = "?", "?"
     seen = set(report.reported_values)
-    for line in log.splitlines():
+    deadline = time.monotonic() + budget_seconds
+    produced = truncated = False
+    for raw in proc.stdout:
+        if time.monotonic() > deadline:
+            truncated = True
+            proc.kill()
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\n")
         if line.startswith("COMMIT "):
-            commit = line[7:]
+            commit, produced = line[7:], True
         elif line.startswith("+++ b/"):
             fname = line[6:]
         elif line.startswith("+") and not line.startswith("+++"):
             for pid, label, rx, sev in SECRET_PATTERNS:
-                m = re.search(rx, line)
-                if m and not is_placeholder(m.group(0), strict=True):
-                    if m.group(0) in seen:
+                for m in re.finditer(rx, line):
+                    value = m.group(0)
+                    if is_placeholder(value, strict=True) and pid not in ("private-key", "gcp-service-account"):
                         continue
-                    seen.add(m.group(0))
+                    if value in seen:
+                        continue
+                    seen.add(value)
                     report.add(sev, f"history:{pid}", "1 Secrets / 11 Runbook", f"{fname} @ {commit}",
-                               f"{label} in git history: {mask(m.group(0))}. Treat as leaked: revoke, then purge.")
+                               f"{label} in git history: {mask(value)}. Treat as leaked: revoke, then purge.")
+    proc.stdout.close()
+    rc = proc.wait()
+    if truncated:
+        report.notes.append(f"Git history scan stopped after {budget_seconds}s; some history was not scanned.")
+    elif not produced and rc != 0:
+        report.notes.append("Git history scan skipped (not a git repo or git failed).")
 
 
 # ---------------------------------------------------------------- output
@@ -529,12 +631,117 @@ def render_md(report: Report) -> str:
     return "\n".join(out) + "\n"
 
 
+SARIF_LEVEL = {"high": "error", "medium": "warning", "low": "note", "info": "note"}
+
+
+def _location_path_line(location: str) -> tuple[str, int]:
+    path = location.split(" @ ", 1)[0]
+    m = re.search(r":(\d+)$", path)
+    if m:
+        return path[:m.start()], int(m.group(1))
+    return path, 1
+
+
+def render_sarif(report: Report) -> str:
+    rules: dict[str, dict] = {}
+    results = []
+    for f in report.findings:
+        rules.setdefault(f.check, {"id": f.check, "name": f.check,
+                                   "shortDescription": {"text": f.check},
+                                   "properties": {"checklist": f.ref}})
+        path, line = _location_path_line(f.location)
+        results.append({
+            "ruleId": f.check,
+            "level": SARIF_LEVEL[f.severity],
+            "message": {"text": f.detail},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": path},
+                "region": {"startLine": line}}}],
+            "properties": {"severity": f.severity},
+        })
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "deploy-security-gate",
+                "informationUri": "https://github.com/vitwit/claude-plugins",
+                "rules": list(rules.values())}},
+            "results": results,
+        }],
+    }
+    return json.dumps(sarif, indent=2)
+
+
+# ---------------------------------------------------------------- allowlist
+ALLOW_MARKER_RX = re.compile(r"security-gate:\s*(?:allow|ignore)|pragma:\s*allowlist\s+secret", re.I)
+
+
+def load_ignore_rules(repo: Path) -> list[tuple[str, str | None, str | None]]:
+    """Parse .security-gate-ignore. Rules (one per line):
+        <check-id>            ignore every finding from this check
+        path:<glob>           ignore every finding whose file matches glob
+        <check-id> <glob>     ignore that check only within matching paths
+    Returns (kind, check, glob) tuples where kind is "check" or "path"."""
+    f = repo / ".security-gate-ignore"
+    rules: list[tuple[str, str | None, str | None]] = []
+    if not f.exists():
+        return rules
+    for raw in f.read_text(errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("path:"):
+            rules.append(("path", None, line[len("path:"):].strip()))
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            rules.append(("check", parts[0], parts[1]))
+        elif "/" in line or "*" in line:
+            rules.append(("path", None, line))
+        else:
+            rules.append(("check", line, None))
+    return rules
+
+
+def is_ignored(finding: Finding, rules: list[tuple[str, str | None, str | None]]) -> bool:
+    path, _ = _location_path_line(finding.location)
+    for kind, check, glob in rules:
+        if kind == "check" and finding.check == check and (glob is None or fnmatch.fnmatch(path, glob)):
+            return True
+        if kind == "path" and glob and fnmatch.fnmatch(path, glob):
+            return True
+    return False
+
+
+def apply_allowlist(report: Report, repo: Path, rules):
+    kept = []
+    line_cache: dict[str, list[str]] = {}
+    for f in report.findings:
+        if is_ignored(f, rules):
+            continue
+        path, line = _location_path_line(f.location)
+        if " @ " not in f.location and re.search(r":\d+$", f.location):
+            lines = line_cache.get(path)
+            if lines is None:
+                try:
+                    lines = (repo / path).read_text(errors="replace").splitlines()
+                except OSError:
+                    lines = []
+                line_cache[path] = lines
+            if 1 <= line <= len(lines) and ALLOW_MARKER_RX.search(lines[line - 1]):
+                continue  # inline `# security-gate: allow` on that line
+        kept.append(f)
+    report.findings = kept
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo")
     ap.add_argument("--build-dir", action="append", default=[], help="Built frontend/mobile output to scan (repeatable). Auto-detects common dirs if omitted.")
     ap.add_argument("--history", action="store_true", help="Also scan all git history for secrets (slower).")
-    ap.add_argument("--format", choices=["md", "json"], default="md")
+    ap.add_argument("--entropy", action="store_true", help="Also flag high-entropy strings no named pattern caught (low severity).")
+    ap.add_argument("--format", choices=["md", "json", "sarif"], default="md")
     ap.add_argument("--fail-on", choices=["high", "medium", "low", "never"], default="high")
     args = ap.parse_args(argv)
 
@@ -560,6 +767,8 @@ def main(argv=None) -> int:
         scan_secrets(report, repo, f, text)
         check_client_exposure(report, repo, f, text)
         check_webhooks(report, repo, f, text)
+        if args.entropy:
+            check_entropy(report, repo, f, text)
 
     check_env_files(report, repo, files, is_git)
     check_build_output(report, repo, build_dirs)
@@ -572,10 +781,14 @@ def main(argv=None) -> int:
     if args.history:
         scan_history(report, repo)
 
+    apply_allowlist(report, repo, load_ignore_rules(repo))
+
     if args.format == "json":
         data = asdict(report)
         data.pop("reported_values", None)
         print(json.dumps(data, indent=2))
+    elif args.format == "sarif":
+        print(render_sarif(report))
     else:
         print(render_md(report))
 

@@ -33,16 +33,19 @@ python3 <skill-dir>/scripts/scan.py <repo> --history
 ```
 
 - Add `--build-dir <dir>` for each built bundle (`dist`, `.next/static`, an unzipped APK/IPA). Shipped bundles are where "public" keys turn out to be secret ones. Common build directories are detected automatically; build the app first if none exist.
-- `--format json` gives machine-readable output. `--fail-on high|medium|low|never` controls the exit code, which is useful in CI.
+- `--entropy` adds a high-entropy pass that catches custom secrets no named pattern knows (low severity; verify each before reporting).
+- `--format json` or `--format sarif` give machine-readable output; SARIF uploads to GitHub code scanning. `--fail-on high|medium|low|never` controls the exit code, which is useful in CI.
+- Confirmed false positives can be suppressed with an inline `# security-gate: allow` comment or a `.security-gate-ignore` file at the repo root (see the README). Prefer suppressing specific findings over lowering `--fail-on`.
 - The scanner masks secret values. Keep it that way in everything you write: never echo a full key into chat, files, commits or PR text, because that creates a second leak.
 
 The scanner checks:
 
-- secret patterns (AWS, Anthropic, OpenAI, Stripe live keys and webhook secrets, GitHub, GitLab, Slack, Google, npm, PyPI, SendGrid, Hugging Face, private keys, DB URLs with passwords, hard-coded `*_SECRET` / `*_TOKEN` assignments) in the working tree, build output and git history
+- secret patterns (AWS, Anthropic, OpenAI, Stripe live keys and webhook secrets, GitHub, GitLab, Slack tokens and app tokens, Google, GCP service accounts, npm, PyPI, SendGrid, Hugging Face, DigitalOcean, New Relic, Shopify, Square, Databricks, Doppler, PlanetScale, Linear, Azure Storage keys, Mailgun, Telegram, Discord webhooks, JWTs, private keys, DB URLs with passwords, hard-coded `*_SECRET` / `*_TOKEN` / `*_SERVICE_ROLE` assignments — quoted or unquoted) in the working tree, build output and git history
+- with `--entropy`, high-entropy strings that match no known format (custom or novel secrets)
 - committed `.env` files and a missing `.gitignore` entry
 - secret-looking variables behind client-exposed prefixes (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, `EXPO_PUBLIC_` and similar), and direct LLM calls from client code
 - source maps in build output
-- GitHub Actions workflows: tag-pinned actions, `pull_request_target`, a missing `permissions:` block, echoed secrets, static cloud keys instead of OIDC, and installs that run lifecycle scripts
+- GitHub Actions workflows: tag-pinned actions, `pull_request_target`, a missing `permissions:` block, echoed secrets, secrets written to files or `$GITHUB_ENV` / `$GITHUB_OUTPUT`, static cloud keys instead of OIDC, and installs that run lifecycle scripts
 - Dockerfiles: secrets in `ARG`/`ENV`, copied `.env` files, and running as root
 - payment webhook handlers with no signature verification
 - coding-agent read access to `.env` files

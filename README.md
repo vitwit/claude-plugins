@@ -34,9 +34,23 @@ python3 deploy-security-gate/skills/deploy-security-gate/scripts/scan.py <repo> 
 Useful flags:
 
 - `--build-dir <dir>` — scan built frontend/mobile output (`dist`, `.next/static`, an unzipped APK/IPA). Repeatable.
-- `--history` — also scan all git history for secrets.
-- `--format json` — machine-readable output.
+- `--history` — also scan all git history for secrets (streamed, so large repos don't blow memory).
+- `--entropy` — additionally flag high-entropy strings that no named pattern caught (low severity; catches custom/novel secrets).
+- `--format json|sarif` — machine-readable output. `sarif` uploads to GitHub code scanning (Security tab).
 - `--fail-on high|medium|low|never` — controls the exit code for CI (`0` = clean, `1` = findings at/above the threshold, `2` = usage error).
+
+### Suppressing findings
+
+Confirmed false positives can be suppressed two ways:
+
+- **Inline:** add `# security-gate: allow` (or `# pragma: allowlist secret`) to the flagged line.
+- **Baseline:** a `.security-gate-ignore` file at the repo root. One rule per line:
+
+  ```
+  secret:stripe-test-secret        # ignore a check everywhere
+  path:vendored/**                 # ignore a path glob
+  secret:high-entropy-string *test_*.py   # ignore a check within matching paths
+  ```
 
 ### Use it in CI
 

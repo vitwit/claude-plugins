@@ -1,0 +1,7 @@
+# deploy-security-gate: findings to suppress. One rule per line:
+#   <check-id>            ignore every finding from this check
+#   path:<glob>           ignore every finding whose file matches glob
+#   <check-id> <glob>     ignore that check only within matching paths
+#
+# The scanner's own test suite deliberately contains fake-but-plausible secrets.
+secret:high-entropy-string *test_scan.py
