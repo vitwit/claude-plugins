@@ -1,0 +1,6 @@
+{
+  "name": "deploy-security-gate",
+  "description": "Security gate for deploys: exposed keys, AI/payment/analytics integrations, single points of failure",
+  "version": "1.0.0",
+  "author": { "name": "Vitwit" }
+}
