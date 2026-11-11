@@ -82,6 +82,11 @@ deploy-security-gate/
       leaked-key-runbook.md        Response steps when a live key is found
 ```
 
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md). Releases are versioned per plugin via the `version`
+field in `plugin.json` (mirrored in `marketplace.json`); git tags mark release points.
+
 ## License
 
 [MIT](./LICENSE)
