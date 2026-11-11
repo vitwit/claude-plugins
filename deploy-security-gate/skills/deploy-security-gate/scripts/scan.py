@@ -49,7 +49,8 @@ TEXT_EXT_BLOCKLIST = {
 SECRET_PATTERNS = [
     ("aws-access-key", "AWS access key ID", r"\b(AKIA|ASIA)[0-9A-Z]{16}\b", "high"),
     ("anthropic-key", "Anthropic API key", r"\bsk-ant-[A-Za-z0-9_\-]{20,}", "high"),
-    ("openai-key", "OpenAI API key", r"\bsk-(?!ant-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{32,}", "high"),
+    ("openrouter-key", "OpenRouter API key", r"\bsk-or-v1-[0-9a-f]{64}\b", "high"),
+    ("openai-key", "OpenAI API key", r"\bsk-(?!ant-)(?!or-)(?:proj-|svcacct-|admin-)?[A-Za-z0-9_\-]{32,}", "high"),
     ("stripe-live-secret", "Stripe live secret/restricted key", r"\b(?:sk|rk)_live_[A-Za-z0-9]{20,}", "high"),
     ("stripe-webhook-secret", "Stripe webhook signing secret", r"\bwhsec_[A-Za-z0-9]{20,}", "high"),
     ("stripe-test-secret", "Stripe test secret key", r"\b(?:sk|rk)_test_[A-Za-z0-9]{20,}", "low"),
@@ -80,13 +81,23 @@ SECRET_PATTERNS = [
     ("telegram-bot-token", "Telegram bot token", r"\b[0-9]{8,10}:AA[A-Za-z0-9_\-]{32,35}\b", "medium"),
     ("discord-webhook", "Discord webhook URL", r"https://discord(?:app)?\.com/api/webhooks/[0-9]{17,}/[A-Za-z0-9_\-]{60,}", "medium"),
     ("mailgun-key", "Mailgun API key", r"\bkey-[0-9a-f]{32}\b", "medium"),
+    ("razorpay-live-key", "Razorpay live key ID", r"\brzp_live_[A-Za-z0-9]{14,}", "high"),
+    ("razorpay-test-key", "Razorpay test key ID", r"\brzp_test_[A-Za-z0-9]{14,}", "low"),
+    ("google-oauth-secret", "Google OAuth client secret", r"\bGOCSPX-[A-Za-z0-9_\-]{28}\b", "high"),
+    ("groq-key", "Groq API key", r"\bgsk_[A-Za-z0-9]{52}\b", "high"),
+    ("xai-key", "xAI API key", r"\bxai-[A-Za-z0-9]{80}\b", "high"),
+    ("perplexity-key", "Perplexity API key", r"\bpplx-[A-Za-z0-9]{40,}\b", "high"),
+    ("replicate-token", "Replicate API token", r"\br8_[A-Za-z0-9]{37,}\b", "high"),
+    ("fal-key", "fal.ai API key", r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{32}\b", "high"),
     ("jwt", "JSON Web Token", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "low"),
 ]
 _SECRET_NAME = r"[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN|SERVICE_ROLE|CREDENTIALS?)[A-Z0-9_]*"
 # Inter-token whitespace is horizontal only ([ \t]); a blank/empty value such as
 # `API_KEY=` must not let the match run onto the next line and capture the next
 # variable (that produced .env.example false positives).
-GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')[ \t]*[:=][ \t]*["\']([^"\'\s]{16,})["\']')
+# `["']?` after the name allows JSON/config shapes like `"API_KEY": "…"` where the key
+# is itself quoted (MCP and agent configs). [ \t] (not \s) keeps a match on one line.
+GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')["\']?[ \t]*[:=][ \t]*["\']([^"\'\s]{16,})["\']')
 # Unquoted assignments: env/YAML/TOML/INI style (`API_KEY=abc…`, `password: abc…`).
 # Only applied to config-ish files to avoid matching expressions in real code.
 GENERIC_ASSIGN_UNQUOTED = re.compile(r"(?ix)(?:^|\b)(" + _SECRET_NAME + r")[ \t]*[:=][ \t]*([^\s\"'#]{16,})")
@@ -100,6 +111,8 @@ NEVER_DOWNGRADE = {
     "npm-token", "pypi-token", "sendgrid-key", "huggingface-token", "db-url-with-password",
     "slack-app-token", "digitalocean-token", "new-relic-key", "shopify-token", "square-token",
     "databricks-token", "doppler-token", "planetscale-token", "linear-key", "azure-storage-key",
+    "openrouter-key", "razorpay-live-key", "google-oauth-secret", "groq-key", "xai-key",
+    "perplexity-key", "replicate-token", "fal-key",
 }
 
 # Entropy detection: catch custom/novel secrets no vendor regex knows. Deliberately
@@ -130,7 +143,20 @@ SECRETISH_NAME = re.compile(
 )
 PUBLIC_OK_NAME = re.compile(r"PUBLISHABLE|PUBLIC_KEY|_PK_|ANON_KEY|SITE_KEY|MEASUREMENT_ID|WRITE_KEY|DSN|CLIENT_ID|POSTHOG_KEY")
 
-CLIENT_LLM = re.compile(r"dangerouslyAllowBrowser\s*:\s*true|https://api\.(?:openai|anthropic)\.com|generativelanguage\.googleapis\.com")
+CLIENT_LLM = re.compile(
+    r"dangerouslyAllowBrowser\s*:\s*true|https://api\.(?:openai|anthropic|groq|x\.ai|perplexity|mistral|cohere)\.com"
+    r"|https://openrouter\.ai/api|generativelanguage\.googleapis\.com|https://api\.replicate\.com")
+# Positive browser signal: don't call a file "client code" just because it sits under
+# src/ (a Node backend does too). Require an actual browser marker, and bail if the file
+# has clear server markers.
+BROWSER_SIGNAL = re.compile(
+    r"""["']use client["']|from\s+["'](?:react|react-dom|vue|svelte|solid-js|preact|@angular)"""
+    r"""|document\.(?:getElementById|querySelector|cookie|createElement)|window\.(?:location|localStorage|sessionStorage)"""
+    r"""|navigator\.|import\.meta\.env\.(?:VITE|PUBLIC)|<template>|ReactDOM""", re.I)
+SERVER_SIGNAL = re.compile(
+    r"""from\s+["'](?:next/server|express|fastify|koa|node:|fs|http|https|net|child_process|@nestjs)"""
+    r"""|require\(["'](?:express|fastify|koa|fs|http|https|net|child_process)"""
+    r"""|createServer|NextApiRequest|APIGatewayProxyEvent|app\.listen""", re.I)
 
 INTEGRATIONS = {
     "ai": {
@@ -167,6 +193,17 @@ WEBHOOK_RULES = [
     ("PayPal", re.compile(r"paypal", re.I), re.compile(r"verify-webhook-signature|verifyWebhookSignature")),
     ("GitHub", re.compile(r"x-hub-signature", re.I), re.compile(r"timingSafeEqual|compare_digest|verify")),
 ]
+# A correct hand-rolled verification (HMAC + constant-time compare) counts as verified,
+# not just the vendor SDK helpers above.
+GENERIC_WEBHOOK_VERIFY = re.compile(
+    r"createHmac|hmac\.new|crypto\.subtle\.(?:verify|sign)|timingSafeEqual|compare_digest|hmacValidator|validateHMAC|hash_hmac")
+# Only treat a file as a webhook *handler* if it actually handles a request. This keeps
+# config files and feature-flag objects (`stripeWebhook: 'on'`) out of the check.
+WEBHOOK_HANDLER_SIGNAL = re.compile(
+    r"\breq\b|\brequest\b|rawBody|raw_body|request\.body|export\s+(?:async\s+)?function\s+(?:POST|handler)"
+    r"|app\.(?:post|use)|router\.(?:post|use)|@app\.route|@router\.(?:post)|http\.HandlerFunc|def\s+\w*webhook"
+    r"|res\.|reply|ctx\.|HttpRequest|FastAPI|flask", re.I)
+WEBHOOK_CONFIG_SUFFIXES = {".json", ".yml", ".yaml", ".toml", ".ini", ".env", ".cfg", ".conf"}
 
 
 @dataclass
@@ -290,7 +327,7 @@ def looks_like_secret_blob(s: str) -> bool:
 
 # ---------------------------------------------------------------- checks
 def scan_secrets(report: Report, repo: Path, path: Path, text: str, where: str = "source"):
-    is_example = re.search(r"(example|sample|template|\.dist)$|\.example\.|fixtures?/|__tests__|/tests?/", rel(repo, path), re.I)
+    is_example = re.search(r"(example|sample|template|\.dist)$|\.example\.|(^|/)(fixtures?|__tests__|tests?|spec|specs)/", rel(repo, path), re.I)
     for pid, label, rx, sev in SECRET_PATTERNS:
         for m in re.finditer(rx, text):
             value = m.group(0)
@@ -305,9 +342,10 @@ def scan_secrets(report: Report, repo: Path, path: Path, text: str, where: str =
             report.add(s, f"secret:{pid}", "1 Secrets / 13 Gate",
                        f"{rel(repo, path)}:{line_of(text, m.start())}",
                        f"{label} in {where}: {mask(value)}")
-    if where == "source" and path.suffix.lower() not in (".md", ".rst", ".txt"):
+    if where in ("source", "build output") and path.suffix.lower() not in (".md", ".rst", ".txt"):
         r = rel(repo, path)
-        is_config = path.suffix.lower() in CONFIG_SUFFIXES or ENV_FILE_RX.search(r)
+        # Unquoted env/YAML assignments only make sense in source config files.
+        is_config = where == "source" and (path.suffix.lower() in CONFIG_SUFFIXES or ENV_FILE_RX.search(r))
         patterns = [GENERIC_ASSIGN]
         if is_config:
             patterns.append(GENERIC_ASSIGN_UNQUOTED)
@@ -403,16 +441,22 @@ def check_client_exposure(report: Report, repo: Path, path: Path, text: str):
                        f"{r}:{line_of(text, m.start())}",
                        f"`{name}` uses a client-exposed prefix but its name suggests a secret. "
                        "Anything with this prefix is inlined into the browser bundle.")
-    is_client = (
-        re.search(r"(^|/)(components|app|pages|src|client|frontend|web)/", r)
+    in_client_tree = bool(
+        re.search(r"(^|/)(components|app|pages|client|frontend|web|public|static|assets)/", r)
         and not re.search(r"(^|/)(api|server|functions|lambda|backend|routes/api)/|route\.(t|j)s$|\.server\.", r)
-        and path.suffix in (".tsx", ".jsx", ".ts", ".js", ".vue", ".svelte")
-    ) or "\"use client\"" in text or "'use client'" in text
+        and path.suffix in (".tsx", ".jsx", ".ts", ".js", ".vue", ".svelte"))
+    # Treat as browser code only with a positive browser signal and no server marker,
+    # so a Node backend under src/ is not mislabelled.
+    is_client = (in_client_tree or BROWSER_SIGNAL.search(text)) and not SERVER_SIGNAL.search(text)
     if is_client:
-        for m in CLIENT_LLM.finditer(text):
-            report.add("high", "client-llm-call", "2 Client & edge / 3 AI",
-                       f"{r}:{line_of(text, m.start())}",
-                       "LLM provider called from client-side code. Route it through the backend/AI gateway so the key never ships to browsers.")
+        report_client_llm(report, r, text)
+
+
+def report_client_llm(report: Report, r: str, text: str):
+    for m in CLIENT_LLM.finditer(text):
+        report.add("high", "client-llm-call", "2 Client & edge / 3 AI",
+                   f"{r}:{line_of(text, m.start())}",
+                   "LLM provider called from client-side code. Route it through the backend/AI gateway so the key never ships to browsers.")
 
 
 def check_build_output(report: Report, repo: Path, build_dirs: list[Path]):
@@ -430,7 +474,10 @@ def check_build_output(report: Report, repo: Path, build_dirs: list[Path]):
                     # Shipped bundles are often larger than the default cap; use the build cap.
                     text = read_text(p, max_bytes=BUILD_MAX_FILE_BYTES)
                     if text:
+                        report.scanned_files += 1  # count bundle files in the scanned total
                         scan_secrets(report, repo, p, text, where="build output")
+                        # Everything in a shipped bundle is browser code by definition.
+                        report_client_llm(report, rel(repo, p), text)
         if maps:
             report.add("medium", "source-maps-in-build", "2 Client & edge", rel(repo, bd),
                        f"{maps} source map file(s) in build output. Upload them privately to the error tracker instead of serving them.")
@@ -500,10 +547,15 @@ def check_webhooks(report: Report, repo: Path, path: Path, text: str):
     r = rel(repo, path)
     if not re.search(r"webhook", r + text[:20000], re.I):
         return
+    # Must look like a request handler, not a config/flags file that merely mentions webhooks.
+    if not WEBHOOK_HANDLER_SIGNAL.search(text):
+        return
+    verified_generic = bool(GENERIC_WEBHOOK_VERIFY.search(text))
     for label, marker, verify in WEBHOOK_RULES:
-        if marker.search(text) and re.search(r"webhook", text, re.I) and not verify.search(text):
+        if marker.search(text) and re.search(r"webhook", text, re.I) and not verify.search(text) and not verified_generic:
             report.add("high", "webhook-unverified", "4 Payments", r,
-                       f"{label} webhook handling found without signature verification in this file. Confirm verification happens before any state change.")
+                       f"{label} webhook handling found without an obvious signature check in this file. "
+                       "Confirm verification (SDK helper or HMAC + constant-time compare) happens before any state change.")
 
 
 def check_agent_config(report: Report, repo: Path, files: list[Path]):

@@ -25,6 +25,7 @@ def run(tmp: Path, *extra: str, entropy: bool = False, allowlist: bool = False) 
         report.scanned_files += 1
         scan.scan_secrets(report, tmp, f, text)
         scan.check_client_exposure(report, tmp, f, text)
+        scan.check_webhooks(report, tmp, f, text)
         if entropy:
             scan.check_entropy(report, tmp, f, text)
     scan.check_env_files(report, tmp, files, is_git)
@@ -247,6 +248,109 @@ class AllowlistTests(unittest.TestCase):
             (tmp / "vendored" / "x.py").write_text('KEY = "' + ("AKIA" + "IOSFODNN7XZ9QW2P") + '"\n')
             (tmp / ".security-gate-ignore").write_text("path:vendored/*\n")
             self.assertFalse(find(run(tmp, allowlist=True), "secret:aws-access-key"))
+
+
+class MissedProviderTests(unittest.TestCase):
+    def test_providers_planted_in_scratch_repo(self):
+        cases = {
+            "razorpay-live-key": "rzp_live_" + "1234567890abcd",
+            "groq-key": "gsk_" + "a" * 52,
+            "xai-key": "xai-" + "a" * 80,
+            "perplexity-key": "pplx-" + "a" * 48,
+            "replicate-token": "r8_" + "a" * 37,
+            "google-oauth-secret": "GOCSPX-" + "a" * 28,
+            "fal-key": "12345678-1234-1234-1234-123456789012:" + "0" * 32,
+        }
+        for pid, value in cases.items():
+            with tempfile.TemporaryDirectory() as d:
+                tmp = Path(d)
+                (tmp / "k.py").write_text(f'KEY = "{value}"\n')
+                self.assertTrue(find(run(tmp), f"secret:{pid}"), pid)
+
+    def test_openrouter_labelled_correctly_not_openai(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "k.py").write_text('KEY = "sk-or-v1-' + "a" * 64 + '"\n')
+            report = run(tmp)
+            self.assertTrue(find(report, "secret:openrouter-key"))
+            self.assertFalse(find(report, "secret:openai-key"))
+
+    def test_json_quoted_key_in_mcp_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / ".mcp.json").write_text(
+                '{ "env": { "OPENROUTER_API_KEY": "sk-or-v1-' + "a" * 64 + '" } }\n')
+            self.assertTrue(find(run(tmp), "secret:openrouter-key"))
+
+
+class BrowserCodeTests(unittest.TestCase):
+    def test_bundle_key_and_fetch_caught_and_counted(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "dist").mkdir()
+            (tmp / "dist" / "bundle.js").write_text(
+                'const K="sk-proj-' + "a" * 40 + '";\nfetch("https://api.openai.com/v1/chat");\n')
+            report = run(tmp, "dist")
+            self.assertTrue(find(report, "secret:openai-key"))
+            self.assertTrue(find(report, "client-llm-call"))
+            self.assertGreaterEqual(report.scanned_files, 1)  # bundle counted
+
+    def test_node_backend_in_src_not_flagged_client(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "src").mkdir()
+            (tmp / "src" / "server.js").write_text(
+                "const express = require('express');\n"
+                'fetch("https://api.openai.com/v1/chat");\napp.listen(3000);\n')
+            self.assertFalse(find(run(tmp), "client-llm-call"))
+
+    def test_public_source_flagged_client(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "public").mkdir()
+            (tmp / "public" / "app.js").write_text('fetch("https://api.openai.com/v1/chat");\n')
+            self.assertTrue(find(run(tmp), "client-llm-call"))
+
+
+class WebhookTests(unittest.TestCase):
+    def test_config_flag_mentioning_webhook_not_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "flags.ts").write_text(
+                "export const flags = { razorpay: 'on', stripeWebhook: 'on' };\n")
+            self.assertFalse(find(run(tmp), "webhook-unverified"))
+
+    def test_handwritten_hmac_verify_counts_as_verified(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "billing.ts").write_text(
+                "export async function POST(req) {\n"
+                "  const sig = req.headers['x-razorpay-signature'];\n"
+                "  const h = createHmac('sha256', secret).update(rawBody).digest('hex');\n"
+                "  if (!timingSafeEqual(Buffer.from(h), Buffer.from(sig))) return;\n"
+                "  // razorpay webhook\n}\n")
+            self.assertFalse(find(run(tmp), "webhook-unverified"))
+
+    def test_unverified_handler_still_flagged(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "hook.ts").write_text(
+                "export async function POST(req) {\n"
+                "  const body = req.body; // razorpay webhook\n"
+                "  await markPaid(body.order_id);\n}\n")
+            self.assertTrue(find(run(tmp), "webhook-unverified"))
+
+
+class TestPathDowngradeTests(unittest.TestCase):
+    def test_top_level_test_dir_downgraded_for_weak_findings(self):
+        # A generic (non-live-format) assignment in a top-level test/ dir downgrades.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / "test").mkdir()
+            (tmp / "test" / "fixture.env").write_text("API_KEY=plainlongvalue123456\n")
+            hits = find(run(tmp), "secret:hardcoded-assignment")
+            # still reported, but the is_example path is recognised (no crash / correct path match)
+            self.assertTrue(all(h.severity in ("low", "medium") for h in hits))
 
 
 class SarifTests(unittest.TestCase):

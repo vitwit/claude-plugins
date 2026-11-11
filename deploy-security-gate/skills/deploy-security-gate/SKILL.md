@@ -40,7 +40,7 @@ python3 <skill-dir>/scripts/scan.py <repo> --history
 
 The scanner checks:
 
-- secret patterns (AWS, Anthropic, OpenAI, Stripe live keys and webhook secrets, GitHub, GitLab, Slack tokens and app tokens, Google, GCP service accounts, npm, PyPI, SendGrid, Hugging Face, DigitalOcean, New Relic, Shopify, Square, Databricks, Doppler, PlanetScale, Linear, Azure Storage keys, Mailgun, Telegram, Discord webhooks, JWTs, private keys, DB URLs with passwords, hard-coded `*_SECRET` / `*_TOKEN` / `*_SERVICE_ROLE` assignments — quoted or unquoted) in the working tree, build output and git history
+- secret patterns (AWS, Anthropic, OpenAI, OpenRouter, Groq, xAI, Perplexity, Replicate, fal, Google API keys and OAuth secrets, Stripe live keys and webhook secrets, Razorpay, GitHub, GitLab, Slack tokens and app tokens, GCP service accounts, npm, PyPI, SendGrid, Hugging Face, DigitalOcean, New Relic, Shopify, Square, Databricks, Doppler, PlanetScale, Linear, Azure Storage keys, Mailgun, Telegram, Discord webhooks, JWTs, private keys, DB URLs with passwords, hard-coded `*_SECRET` / `*_TOKEN` / `*_SERVICE_ROLE` assignments — quoted (including JSON/MCP configs) or unquoted) in the working tree, build output and git history
 - with `--entropy`, high-entropy strings that match no known format (custom or novel secrets)
 - committed `.env` files and a missing `.gitignore` entry
 - secret-looking variables behind client-exposed prefixes (`NEXT_PUBLIC_`, `VITE_`, `REACT_APP_`, `EXPO_PUBLIC_` and similar), and direct LLM calls from client code
@@ -69,6 +69,11 @@ For every integration the scanner listed, or that you find in the code, read the
 - tool calls that run with admin credentials
 - PII sent to analytics
 - RAG queries without a tenant filter
+- indirect prompt injection: documents, web pages, transcripts or tool results the model reads being treated as instructions (checklist 3.17)
+- file uploads parsed without type/size/archive checks or a sandbox (3.18)
+- SSRF: a `*_url` the model or a tool fetches with no block on private or metadata addresses (3.19)
+
+The webhook, client-LLM and secret checks are heuristics: the scanner flags candidates but can miss a hand-written control or a non-standard layout. Always confirm by reading the code — a webhook verified with `createHmac` + `timingSafeEqual`, or a backend that happens to sit under `src/`, is fine even if a tool flags or misses it.
 
 ### 5. Check for single points of failure
 

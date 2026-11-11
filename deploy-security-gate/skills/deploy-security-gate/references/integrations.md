@@ -34,6 +34,12 @@ Read only the sections for integrations in scope. Each one lists what good looks
 - Retries, timeouts and fallbacks: is the provider client configured with `timeout` and `maxRetries`? Is there a fallback provider or a circuit breaker?
 - Logging of prompts and responses: is it redacted, with a retention limit?
 
+**Untrusted input to the model (not just its output):**
+
+- **Indirect prompt injection.** Find where external content enters the prompt: RAG chunks, fetched web pages, uploaded documents, email/transcript bodies, prior tool results. It must be delimited as data and must not be able to trigger tools or change policy. A "summarise this URL/file" feature that then has tools available is the classic hole — the document can tell the model to call them. High-impact tools still need the 3.9 checks regardless of what the content says.
+- **File uploads.** Look for the upload handler and the parser (PDF, Office, image, CSV). Check: MIME/extension allowlist verified by content not filename, a size cap, a page/dimension/duration cap, archive handling (zip-bomb and path traversal), and sandboxed parsing (no network, timeout). Extracted text is untrusted — it feeds back into the injection concern above.
+- **SSRF on URL inputs.** Any `*_url` / `image_url` / `video_url` the server or a tool fetches must be SSRF-guarded: `https`-only, DNS resolved and re-checked against private/loopback/link-local ranges and `169.254.169.254`, redirects re-validated, ideally via an egress proxy. `fetch(url_from_request)` with no checks is a red flag.
+
 **Red flags:**
 
 - `dangerouslyAllowBrowser: true`.
@@ -41,6 +47,8 @@ Read only the sections for integrations in scope. Each one lists what good looks
 - An open proxy route that forwards any body to the provider.
 - No per-user limit (a cost-exhaustion risk).
 - Destructive tools (delete, refund, send email, payments) with no confirmation step.
+- Retrieved or uploaded content that can reach a tool call without a trust boundary.
+- A model/tool fetching a user-supplied URL with no SSRF guard.
 
 ## MCP servers and agent tools
 

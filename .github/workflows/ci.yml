@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run scanner unit tests
+        working-directory: deploy-security-gate/skills/deploy-security-gate/scripts
+        run: python3 -m unittest test_scan
+      - name: Self-scan (gate on high findings)
+        run: python3 deploy-security-gate/skills/deploy-security-gate/scripts/scan.py . --history --entropy --fail-on high

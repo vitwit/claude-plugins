@@ -80,6 +80,9 @@ Five rules apply to every section:
 - 3.14 `[manual]` Each provider's retention and training terms (ZDR or no-training) and data residency are recorded.
 - 3.15 `[code]` Prompt and response logs are encrypted, access-controlled, redacted and kept only for the retention period.
 - 3.16 `[code]` At least two providers or regions are configured, with failover on 429, 5xx or timeout. Each provider has a timeout, jittered retries and a circuit breaker, and there is a defined degraded mode. `[manual]` Failover is tested monthly.
+- 3.17 `[code]` Indirect prompt injection is contained. Any content the model reads — documents, web pages, transcripts, emails, tool results, RAG chunks — is treated as untrusted *data*, never as instructions. It is clearly delimited in the prompt, cannot invoke tools or change policy on its own, and high-impact tool calls still require the checks in 3.9 regardless of what the content says. This is distinct from 3.8 (which covers the model's *output*); 3.17 covers the model's *input*. Maps to OWASP LLM01.
+- 3.18 `[code]` File inputs to the model or its tools are validated before parsing: allowlisted MIME type and extension (verified by content, not just the name), a size cap, a page/dimension/duration cap, and rejection or safe handling of archives (zip-bomb and path-traversal defence). Office, PDF and image parsing runs in a sandbox with no network and a timeout. Extracted text is treated as untrusted per 3.17.
+- 3.19 `[code]` URLs the model or a tool fetches (for example an image, video or document URL from the request, as in a `*_url` parameter) are SSRF-guarded: scheme allowlist (`https` only), DNS resolved and re-checked against blocked ranges (private, loopback, link-local and the cloud metadata endpoint `169.254.169.254`), redirects re-validated, and ideally routed through an egress proxy. See 14.6.
 
 ## 4. Payments
 
@@ -222,7 +225,7 @@ Five rules apply to every section:
 
 ## 14. Emerging risks (2025–2026)
 
-- 14.1 `[auto]` Coding agents are denied read access to `.env` files (in Claude Code, `permissions.deny` with `Read(./.env)` and `Read(./.env.*)`). `.gitignore` and `.claudeignore` do not block agent reads.
+- 14.1 `[auto]` Coding agents are denied read access to `.env` files (in Claude Code, `permissions.deny` with `Read(./.env)` and `Read(./.env.*)`). Because deny takes precedence over allow, a broad `Read(./.env.*)` also blocks committed templates like `.env.example`, and an allow rule will not re-open them. To keep templates readable, deny the specific secret-bearing files instead — `Read(./.env)`, `Read(./.env.local)`, `Read(./.env.*.local)`, `Read(./.env.production)`, `Read(./.env.development)` — rather than the catch-all glob. `.gitignore` and `.claudeignore` do not block agent reads.
 - 14.2 `[manual]` No plaintext secrets are on developer disks; secrets are injected at runtime (`doppler run`, `infisical run`, `op run`). Agents never hold prod credentials and run sandboxed.
 - 14.3 `[code]` MCP servers accept only tokens issued to them (audience check); token passthrough is forbidden.
 - 14.4 `[code]` MCP proxies with a static client ID implement per-client consent, exact redirect-URI matching, and single-use `state` that expires in about 10 minutes.
