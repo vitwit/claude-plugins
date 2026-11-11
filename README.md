@@ -7,7 +7,7 @@ A [Claude Code](https://claude.com/claude-code) plugin marketplace maintained by
 Add the marketplace, then install a plugin:
 
 ```
-/plugin marketplace add vitwit/claude-skills
+/plugin marketplace add vitwit/claude-plugins
 /plugin install deploy-security-gate@vitwit
 ```
 
