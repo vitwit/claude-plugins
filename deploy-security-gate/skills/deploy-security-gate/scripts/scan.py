@@ -14,6 +14,7 @@ Exit codes: 0 = no findings at or above --fail-on, 1 = findings at or above it,
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -31,6 +32,9 @@ SKIP_DIRS = {
 }
 BUILD_DIR_CANDIDATES = ["dist", "build", "out", ".next/static", ".output/public", "public/build"]
 MAX_FILE_BYTES = 2_000_000
+# Shipped bundles are routinely larger than MAX_FILE_BYTES and are the whole point
+# of the build-output pass, so they get a much higher cap.
+BUILD_MAX_FILE_BYTES = 25_000_000
 TEXT_EXT_BLOCKLIST = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip", ".gz", ".tgz",
     ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".wasm", ".jar", ".class",
@@ -61,16 +65,28 @@ SECRET_PATTERNS = [
     ("db-url-with-password", "Connection string with inline password",
      r"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?)://[^:\s/'\"]+:[^@\s'\"]{6,}@[^\s'\"]+", "high"),
 ]
-GENERIC_ASSIGN = re.compile(
-    r"""(?ix)
-    \b([A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN)[A-Z0-9_]*)
-    \s*[:=]\s*["']([^"'\s]{16,})["']
-    """
-)
-PLACEHOLDER_HINTS = (
-    "example", "xxx", "your", "changeme", "change_me", "placeholder", "dummy", "sample",
-    "<", "${", "{{", "process.env", "os.environ", "getenv", "****", "...", "redacted",
-    "todo", "fake", "test", "secret_here", "insert",
+_SECRET_NAME = r"[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN)[A-Z0-9_]*"
+GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')\s*[:=]\s*["\']([^"\'\s]{16,})["\']')
+# Unquoted assignments: env/YAML/TOML/INI style (`API_KEY=abc…`, `password: abc…`).
+# Only applied to config-ish files to avoid matching expressions in real code.
+GENERIC_ASSIGN_UNQUOTED = re.compile(r"(?ix)(?:^|\b)(" + _SECRET_NAME + r")\s*[:=]\s*([^\s\"'#]{16,})")
+CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".ini", ".properties", ".conf", ".cfg", ".env"}
+ENV_FILE_RX = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
+# High-confidence live-credential formats: never downgrade these, even in a test or
+# example path. A real AKIA/sk-ant/sk_live value in a fixture is still a leaked key.
+NEVER_DOWNGRADE = {
+    "aws-access-key", "anthropic-key", "openai-key", "stripe-live-secret", "stripe-webhook-secret",
+    "github-token", "gitlab-token", "slack-token", "gcp-service-account", "private-key",
+    "npm-token", "pypi-token", "sendgrid-key", "huggingface-token", "db-url-with-password",
+}
+# Split into two groups. STRUCTURAL hints are matched as substrings (they can't be
+# part of a real secret). WORD hints are English words that routinely appear *inside*
+# real tokens ("latest" contains "test", "yourco" contains "your"), so they are only
+# treated as placeholders when they stand alone, i.e. not flanked by other letters.
+PLACEHOLDER_STRUCTURAL = ("xxx", "<", "${", "{{", "process.env", "os.environ", "getenv", "****", "...")
+PLACEHOLDER_WORDS = (
+    "example", "your", "changeme", "change_me", "placeholder", "dummy", "sample",
+    "redacted", "todo", "fake", "test", "secret_here", "insert",
 )
 
 PUBLIC_PREFIXES = ("NEXT_PUBLIC_", "VITE_", "REACT_APP_", "EXPO_PUBLIC_", "NUXT_PUBLIC_",
@@ -151,14 +167,25 @@ def mask(value: str) -> str:
     return f"{value[:6]}…{value[-2:]} ({len(value)} chars)"
 
 
-KEY_PLACEHOLDER_HINTS = ("example", "xxxx", "your", "placeholder", "dummy", "redacted",
-                         "<", "${", "{{", "****", "...", "changeme")
+KEY_PLACEHOLDER_STRUCTURAL = ("xxxx", "<", "${", "{{", "****", "...")
+KEY_PLACEHOLDER_WORDS = ("example", "your", "placeholder", "dummy", "redacted", "changeme")
+
+
+def _word_present(word: str, low: str) -> bool:
+    # A standalone occurrence: not flanked by other ASCII letters. Underscores, digits
+    # and punctuation count as boundaries, so "your_token" matches but "yourcompany"
+    # and "latest" do not.
+    return re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", low) is not None
 
 
 def is_placeholder(value: str, strict: bool = False) -> bool:
     """strict=True for values that already match a known key format (narrower hint list)."""
     low = value.lower()
-    if any(h in low for h in (KEY_PLACEHOLDER_HINTS if strict else PLACEHOLDER_HINTS)):
+    structural = KEY_PLACEHOLDER_STRUCTURAL if strict else PLACEHOLDER_STRUCTURAL
+    words = KEY_PLACEHOLDER_WORDS if strict else PLACEHOLDER_WORDS
+    if any(h in low for h in structural):
+        return True
+    if any(_word_present(w, low) for w in words):
         return True
     if len(set(value)) <= 3:  # "aaaaaaaa", "00000000"
         return True
@@ -187,13 +214,12 @@ def list_files(repo: Path) -> tuple[list[Path], bool]:
     return files, False
 
 
-def read_text(path: Path) -> str | None:
+def read_text(path: Path, max_bytes: int = MAX_FILE_BYTES) -> str | None:
     if path.suffix.lower() in TEXT_EXT_BLOCKLIST:
         return None
     try:
-        if path.stat().st_size > MAX_FILE_BYTES:
-            return None
-        data = path.read_bytes()
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)  # read a prefix rather than skip large files
     except OSError:
         return None
     if b"\0" in data[:4096]:
@@ -222,25 +248,55 @@ def scan_secrets(report: Report, repo: Path, path: Path, text: str, where: str =
                 continue
             report.reported_values.add(value)
             s = sev
-            if is_example and s == "high":
+            # Only downgrade in example/test paths for weaker heuristics; a high-confidence
+            # live-credential format is a leaked key wherever it sits.
+            if is_example and s == "high" and pid not in NEVER_DOWNGRADE:
                 s = "medium"
             report.add(s, f"secret:{pid}", "1 Secrets / 13 Gate",
                        f"{rel(repo, path)}:{line_of(text, m.start())}",
                        f"{label} in {where}: {mask(value)}")
     if where == "source" and path.suffix.lower() not in (".md", ".rst", ".txt"):
-        for m in GENERIC_ASSIGN.finditer(text):
-            name, value = m.group(1), m.group(2)
-            if is_placeholder(value) or PUBLIC_OK_NAME.search(name.upper()):
-                continue
-            if any(re.fullmatch(rx, value) for _, _, rx, _ in SECRET_PATTERNS):
-                continue  # already reported
-            report.add("medium", "secret:hardcoded-assignment", "1 Secrets",
-                       f"{rel(repo, path)}:{line_of(text, m.start())}",
-                       f"Hard-coded value assigned to `{name}`: {mask(value)}")
+        r = rel(repo, path)
+        is_config = path.suffix.lower() in CONFIG_SUFFIXES or ENV_FILE_RX.search(r)
+        patterns = [GENERIC_ASSIGN]
+        if is_config:
+            patterns.append(GENERIC_ASSIGN_UNQUOTED)
+        seen_spans: set[tuple[int, int]] = set()
+        for rx in patterns:
+            for m in rx.finditer(text):
+                name, value = m.group(1), m.group(2).strip()
+                span = (m.start(2), m.end(2))
+                if span in seen_spans:
+                    continue
+                seen_spans.add(span)
+                if len(value) < 16 or is_placeholder(value) or PUBLIC_OK_NAME.search(name.upper()):
+                    continue
+                if any(re.fullmatch(prx, value) for _, _, prx, _ in SECRET_PATTERNS):
+                    continue  # already reported
+                report.add("medium", "secret:hardcoded-assignment", "1 Secrets",
+                           f"{r}:{line_of(text, m.start())}",
+                           f"Hard-coded value assigned to `{name}`: {mask(value)}")
+
+
+def gitignore_covers_env(gi: Path) -> bool:
+    """True only if a .gitignore line actually matches the `.env` file itself.
+    A line like `.env.local` or `.envrc` does not count (substring matching is wrong)."""
+    try:
+        lines = gi.read_text(errors="replace").splitlines()
+    except OSError:
+        return False
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        line = line.lstrip("/").rstrip("/")
+        if fnmatch.fnmatch(".env", line):
+            return True
+    return False
 
 
 def check_env_files(report: Report, repo: Path, files: list[Path], is_git: bool):
-    env_rx = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
+    env_rx = ENV_FILE_RX
     ok_rx = re.compile(r"\.(example|sample|template|dist|defaults)$")
     tracked = set()
     if is_git:
@@ -259,7 +315,7 @@ def check_env_files(report: Report, repo: Path, files: list[Path], is_git: bool)
                            "Plaintext env file on disk. Prefer runtime injection from the secrets manager.")
     gi = repo / ".gitignore"
     has_env = any(env_rx.search(rel(repo, f)) for f in files) or (repo / ".env").exists()
-    if (is_git or has_env) and (not gi.exists() or ".env" not in gi.read_text(errors="replace")):
+    if (is_git or has_env) and not (gi.exists() and gitignore_covers_env(gi)):
         report.add("medium", "gitignore-env", "1 Secrets", ".gitignore",
                    "`.env` files are not ignored by git.")
 
@@ -296,12 +352,11 @@ def check_build_output(report: Report, repo: Path, build_dirs: list[Path]):
                 if n.endswith(".map"):
                     maps += 1
                     continue
-                if p.suffix.lower() in (".js", ".mjs", ".cjs", ".html", ".json", ".css", ".txt"):
-                    text = read_text(p)
+                if p.suffix.lower() in (".js", ".mjs", ".cjs", ".html", ".json", ".css", ".txt", ".xml"):
+                    # Shipped bundles are often larger than the default cap; use the build cap.
+                    text = read_text(p, max_bytes=BUILD_MAX_FILE_BYTES)
                     if text:
                         scan_secrets(report, repo, p, text, where="build output")
-                        for m in re.finditer(r"\b(sk|rk)_live_|sk-ant-|AKIA[0-9A-Z]{16}", text):
-                            pass  # covered by scan_secrets
         if maps:
             report.add("medium", "source-maps-in-build", "2 Client & edge", rel(repo, bd),
                        f"{maps} source map file(s) in build output. Upload them privately to the error tracker instead of serving them.")
@@ -342,7 +397,8 @@ def check_workflows(report: Report, repo: Path):
 
 def check_dockerfiles(report: Report, repo: Path, files: list[Path]):
     for f in files:
-        if not re.match(r"(Dockerfile|Containerfile)", f.name):
+        # Matches Dockerfile, Dockerfile.prod, app.Dockerfile, api.dockerfile, Containerfile.
+        if not re.search(r"(?i)(?:^|\.)(?:docker|container)file(?:$|\.)", f.name):
             continue
         text = read_text(f) or ""
         r = rel(repo, f)
@@ -398,7 +454,17 @@ def detect_integrations(report: Report, repo: Path, files: list[Path]):
         elif name in ("requirements.txt", "pyproject.toml", "Pipfile", "go.mod", "Gemfile", "composer.json"):
             text = read_text(f) or ""
             for tok in re.findall(r"[A-Za-z0-9@/_.\-]+", text):
-                deps.add(tok.lower())
+                tok = tok.lower()
+                deps.add(tok)
+                # Path-style deps (go.mod: github.com/sashabaranov/go-openai) stay one token,
+                # so add the final path segment and its last hyphen piece (len>=4 to avoid
+                # matching short names like "ai" against unrelated modules).
+                if "/" in tok:
+                    seg = tok.rsplit("/", 1)[-1]
+                    deps.add(seg)
+                    tail = seg.rsplit("-", 1)[-1]
+                    if len(tail) >= 4:
+                        deps.add(tail)
     for cat, table in INTEGRATIONS.items():
         found = sorted({label for pkg, label in table.items() if pkg in deps})
         if found:

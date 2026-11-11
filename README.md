@@ -44,6 +44,15 @@ Useful flags:
 - run: python3 deploy-security-gate/skills/deploy-security-gate/scripts/scan.py . --fail-on high
 ```
 
+### Tests
+
+The scanner has a standard-library regression suite (no dependencies):
+
+```bash
+cd deploy-security-gate/skills/deploy-security-gate/scripts
+python3 -m unittest test_scan
+```
+
 ## Repository layout
 
 ```
