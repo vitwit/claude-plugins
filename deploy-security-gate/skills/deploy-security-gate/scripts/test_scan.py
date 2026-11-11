@@ -106,6 +106,24 @@ class SecretScanTests(unittest.TestCase):
             (tmp / "app.py").write_text("API_KEY = os.environ.get('API_KEY')\n")
             self.assertFalse(find(run(tmp), "secret:hardcoded-assignment"))
 
+    def test_b2_empty_value_does_not_consume_next_line(self):
+        # `SARVAM_API_KEY=` with an empty value must not grab the next variable as its
+        # value (the .env.example false positive). The empty key itself is not a finding.
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / ".env.example").write_text(
+                "SARVAM_API_KEY=\nDATABASE_PASSWORD=\nOPENAI_API_KEY=\n")
+            self.assertFalse(find(run(tmp), "secret:hardcoded-assignment"))
+
+    def test_b2_real_unquoted_value_still_found_after_empty_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            tmp = Path(d)
+            (tmp / ".env.example").write_text(
+                "SARVAM_API_KEY=\nDATABASE_PASSWORD=supersecretvalue123\n")
+            hits = find(run(tmp), "secret:hardcoded-assignment")
+            self.assertEqual(len(hits), 1)
+            self.assertIn("DATABASE_PASSWORD", hits[0].detail)
+
 
 class DockerfileTests(unittest.TestCase):
     def test_b3_alternate_dockerfile_names_scanned(self):

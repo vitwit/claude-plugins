@@ -83,10 +83,13 @@ SECRET_PATTERNS = [
     ("jwt", "JSON Web Token", r"\beyJ[A-Za-z0-9_\-]{10,}\.eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}", "low"),
 ]
 _SECRET_NAME = r"[A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|AUTH_?TOKEN|TOKEN|SERVICE_ROLE|CREDENTIALS?)[A-Z0-9_]*"
-GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')\s*[:=]\s*["\']([^"\'\s]{16,})["\']')
+# Inter-token whitespace is horizontal only ([ \t]); a blank/empty value such as
+# `API_KEY=` must not let the match run onto the next line and capture the next
+# variable (that produced .env.example false positives).
+GENERIC_ASSIGN = re.compile(r"(?ix)\b(" + _SECRET_NAME + r')[ \t]*[:=][ \t]*["\']([^"\'\s]{16,})["\']')
 # Unquoted assignments: env/YAML/TOML/INI style (`API_KEY=abc…`, `password: abc…`).
 # Only applied to config-ish files to avoid matching expressions in real code.
-GENERIC_ASSIGN_UNQUOTED = re.compile(r"(?ix)(?:^|\b)(" + _SECRET_NAME + r")\s*[:=]\s*([^\s\"'#]{16,})")
+GENERIC_ASSIGN_UNQUOTED = re.compile(r"(?ix)(?:^|\b)(" + _SECRET_NAME + r")[ \t]*[:=][ \t]*([^\s\"'#]{16,})")
 CONFIG_SUFFIXES = {".yml", ".yaml", ".toml", ".ini", ".properties", ".conf", ".cfg", ".env"}
 ENV_FILE_RX = re.compile(r"(^|/)\.env(\.[A-Za-z0-9_-]+)?$")
 # High-confidence live-credential formats: never downgrade these, even in a test or
